@@ -1,192 +1,157 @@
-using System.Collections.Generic;
 using System.Linq;
 using Rage;
 using Rage.Native;
 using Rage.Attributes;
+using Rage.ConsoleCommands.AutoCompleters;
 
-namespace DLSv2.Threads
+namespace DLSv2.Threads;
+
+using Core;
+using Utils;
+
+internal static class PlayerManager
 {
-    using Core;
-    using Core.Lights;
-    using Core.Sound;
-    using Utils;
+    private static Vehicle prevVehicle;
+        
+    public static bool registeredKeys;
 
-    class PlayerManager
+    internal static void MainLoop()
     {
-        private static Vehicle prevVehicle;
-        private static ManagedVehicle currentManaged;
-
-        public static bool registeredKeys;
-
-        internal static void MainLoop()
+        while (true)
         {
-            while (true)
+            VehicleOwner.Process();
+
+            Ped playerPed = Game.LocalPlayer.Character;
+            if (playerPed.IsInAnyVehicle(false) && playerPed.CurrentVehicle.Driver == playerPed
+                                                && playerPed.CurrentVehicle.GetDLS() != null)
             {
-                Ped playerPed = Game.LocalPlayer.Character;
-                if (playerPed.IsInAnyVehicle(false) && playerPed.CurrentVehicle.Driver == playerPed
-                    && playerPed.CurrentVehicle.IsDLS())
+                Vehicle veh = playerPed.CurrentVehicle;
+                VehicleOwner.AddPlayerVehicle(veh);
+
+                ControlsManager.DisableControls();
+
+                // Registers new Vehicle
+                if (ManagedVehicle.ActivePlayerVehicle == null || prevVehicle != veh)
                 {
-                    Vehicle veh = playerPed.CurrentVehicle;
-                    ControlsManager.DisableControls();
+                    ManagedVehicle.ActivePlayerVehicle = veh.GetManagedVehicle();
+                    prevVehicle = veh;
+                    veh.IsInteriorLightOn = false;
+                    ManagedVehicle.ActivePlayerVehicle.UpdateLights();
+                    veh.IsSirenSilent = true;
+                    registeredKeys = false;
+                }
 
-                    // Registers new Vehicle
-                    if (currentManaged == null || prevVehicle != veh)
-                    {
-                        currentManaged = veh.GetManagedVehicle();
-                        prevVehicle = veh;
-                        veh.IsInteriorLightOn = false;
-                        ControlsManager.ClearInputs();
-                        registeredKeys = false;
-                        LightController.Update(currentManaged);
-                        veh.IsSirenSilent = true;
-                    }
+                if (!registeredKeys)
+                {
+                    ManagedVehicle.ActivePlayerVehicle.RegisterInputs();
+                    registeredKeys = true;
+                }
 
-                    // Registers keys
-                    if (!registeredKeys)
-                    {
-                        currentManaged.RegisterInputs();
-                        registeredKeys = true;
-                    }
+                if (!ManagedVehicle.ActivePlayerVehicle.SirenOn && !veh.IsSirenSilent)
+                {
+                    ManagedVehicle.ActivePlayerVehicle.AudioControlGroups.First().Value.Toggle();
+                    ManagedVehicle.ActivePlayerVehicle.UpdateAudio();
+                }
+                else if (ManagedVehicle.ActivePlayerVehicle.SirenOn && veh.IsSirenSilent)
+                {
+                    // Clears audio control groups
+                    foreach (var cG in ManagedVehicle.ActivePlayerVehicle.AudioControlGroups.Values)
+                        cG.Disable();
 
-                    if (!currentManaged.SirenOn && !veh.IsSirenSilent)
-                    {
-                        AudioControlGroupManager.ToggleControlGroup(currentManaged, currentManaged.AudioControlGroups.First().Key);
-                        AudioController.Update(currentManaged);
-                    }
-                    else if (currentManaged.SirenOn && veh.IsSirenSilent)
-                    {
-                        // Clears audio control groups
-                        foreach (string key in currentManaged.AudioControlGroups.Keys.ToList())
-                            currentManaged.AudioControlGroups[key] = (false, 0);
+                    // Updates audio
+                    ManagedVehicle.ActivePlayerVehicle.UpdateAudio();
+                }
 
-                        // Updates audio
-                        AudioController.Update(currentManaged);
-                    }
-
-                    // Dev Mode UI
-                    if (Settings.DEVMODE)
+                // Dev Mode UI
+                if (Settings.DEVMODE)
+                {
+                    var controlGroups = "CGs: ";
+                    var cGs = ManagedVehicle.ActivePlayerVehicle.LightControlGroups.Values.ToList();
+                    foreach (var cG in cGs)
                     {
-                        string controlGroups = "CGs: ";
-                        List<ControlGroup> cGs = ControlGroupManager.ControlGroups[veh.Model].Values.ToList();
-                        foreach (ControlGroup cG in cGs)
+                        if (cG.Enabled)
                         {
-                            if (currentManaged.LightControlGroups[cG.Name].Item1)
+                            controlGroups += "~g~" + cG.BaseControlGroup.Name + " (";
+                            foreach (var modeIndex in cG.ActiveIndexes)
                             {
-                                controlGroups += "~g~" + cG.Name + " (";
-                                List<string> cGModes = ControlGroupManager.ControlGroups[veh.Model][cG.Name].Modes[currentManaged.LightControlGroups[cG.Name].Item2].Modes;
-                                foreach (string mode in cGModes)
+                                var cGModes = cG.BaseControlGroup.Modes[modeIndex]?.Modes;
+                                foreach (var mode in cG.BaseControlGroup.Modes[modeIndex].Modes)
                                 {
                                     controlGroups += mode;
                                     if (cGModes.IndexOf(mode) != cGModes.Count - 1) controlGroups += " + ";
                                 }
-                                controlGroups += ")";
                             }
-                            else
-                                controlGroups += "~r~" + cG.Name;
-
-                            if (cGs.IndexOf(cG) != cGs.Count - 1) controlGroups += "~w~~s~, ";
+                            controlGroups += ")";
                         }
+                        else
+                            controlGroups += "~r~" + cG.BaseControlGroup.Name;
 
-                        NativeFunction.Natives.SET_TEXT_FONT(4);
-                        NativeFunction.Natives.SET_TEXT_SCALE(1.0f, 0.6f);
-                        NativeFunction.Natives.BEGIN_TEXT_COMMAND_DISPLAY_TEXT("STRING");
-                        NativeFunction.Natives.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME(controlGroups);
-                        NativeFunction.Natives.END_TEXT_COMMAND_DISPLAY_TEXT(0, 0);
+                        if (cGs.IndexOf(cG) != cGs.Count - 1) controlGroups += "~w~~s~, ";
                     }
 
-                    // Adds Brake Light Functionality
-                    if (Settings.BRAKELIGHTS && NativeFunction.Natives.IS_VEHICLE_STOPPED<bool>(veh))
-                        NativeFunction.Natives.SET_VEHICLE_BRAKE_LIGHTS(veh, true);
-                }
-                else if (registeredKeys)
-                {
-                    ControlsManager.ClearInputs();
-                    registeredKeys = false;
+                    NativeFunction.Natives.SET_TEXT_FONT(4);
+                    NativeFunction.Natives.SET_TEXT_SCALE(1.0f, 0.6f);
+                    NativeFunction.Natives.BEGIN_TEXT_COMMAND_DISPLAY_TEXT("STRING");
+                    NativeFunction.Natives.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME(controlGroups);
+                    NativeFunction.Natives.END_TEXT_COMMAND_DISPLAY_TEXT(0, 0);
                 }
 
-                GameFiber.Yield();
+                // Adds Brake Light Functionality
+                if (Settings.BRAKELIGHTS && NativeFunction.Natives.IS_VEHICLE_STOPPED<bool>(veh))
+                    NativeFunction.Natives.SET_VEHICLE_BRAKE_LIGHTS(veh, true);
             }
-        }
+            else if (registeredKeys)
+            {
+                ControlsManager.ClearInputs();
+                registeredKeys = false;
+            }
 
-        [ConsoleCommand]
-        private static void DebugCurrentModes()
+            GameFiber.Yield();
+        }
+    }
+
+    [ConsoleCommand]
+    private static void DebugCurrentModes(bool showConditionsDetail = true)
+    {
+        if (ManagedVehicle.ActivePlayerVehicle == null)
         {
-            if (currentManaged == null)
-            {
-                ("No current managed DLS vehicle").ToLog(true);
-                return;
-            }
-
-            if (!currentManaged.Vehicle)
-            {
-                ("Current managed DLS vehicle is invalid").ToLog(true);
-            }
-
-            ("").ToLog(true);
-            ("--------------------------------------------------------------------------------").ToLog(true);
-            ($"Active modes for managed DLS vehicle {currentManaged.Vehicle.Model.Name}").ToLog(true);
-            ("").ToLog(true);
-
-            ("Light Control Groups:").ToLog(true);
-            foreach (var cg in currentManaged.LightControlGroups)
-            {
-                string modes = string.Join(" + ", ControlGroupManager.ControlGroups[currentManaged.Vehicle.Model][cg.Key].Modes[currentManaged.LightControlGroups[cg.Key].Item2].Modes);
-                ($"  {boolToCheck(cg.Value.Item1)}\t{cg.Key}: ({cg.Value.Item2}) = {modes}").ToLog(true);
-            }
-
-            ("").ToLog(true);
-            ("").ToLog(true);
-            ("Light Modes:").ToLog(true);
-            foreach (var slm in currentManaged.StandaloneLightModes)
-            {
-                string modeName = slm.Key;
-                bool enabled = slm.Value;
-                Mode mode = ModeManager.Modes[currentManaged.Vehicle.Model][modeName];
-                ($"  {boolToCheck(enabled)}  {modeName}").ToLog(true);
-
-                if (mode.Triggers != null && mode.Triggers.NestedConditions.Count > 0)
-                {
-                    bool triggers = mode.Triggers.GetInstance(currentManaged).LastTriggered;
-                    ($"       {boolToCheck(triggers)}  Triggers:").ToLog(true);
-                    logNestedConditions(currentManaged, mode.Triggers, 5);
-                }
-
-                if (mode.Requirements != null && mode.Requirements.NestedConditions.Count > 0)
-                {
-                    bool reqs = mode.Triggers.GetInstance(currentManaged).LastTriggered;
-                    ($"       {boolToCheck(reqs)}  Requirements:").ToLog(true);
-                    logNestedConditions(currentManaged, mode.Requirements, 5);
-                }
-            }
-
-            ("").ToLog(true);
-            ("").ToLog(true);
-            ("Active Light Modes:").ToLog(true);
-            foreach (var mode in currentManaged.ActiveLightModes)
-            {
-                ($"  {mode}").ToLog(true);
-            }
-
-            ("").ToLog(true);
-            ("--------------------------------------------------------------------------------").ToLog(true);
-            ("").ToLog(true);
+            ("No current managed DLS vehicle").ToLog(LogLevel.ERROR);
+            return;
         }
 
-        private static string boolToCheck(bool state) => state ? "[x]" : "[ ]";
-
-        private static void logNestedConditions(ManagedVehicle mv, GroupConditions group, int level = 0)
+        if (!ManagedVehicle.ActivePlayerVehicle.Vehicle)
         {
-            string indent = new string(' ', 2 * level);
-            foreach (var condition in group.NestedConditions)
-            {
-                var inst = condition.GetInstance(mv);
-                string updateInfo = inst.TimeSinceUpdate == Game.GameTime ? "never" : $"{inst.TimeSinceUpdate} ms ago";
-                ($"{indent} - {boolToCheck(inst.LastTriggered)} {condition.GetType().Name} ({updateInfo})").ToLog(true);
-                if (condition is GroupConditions subGroup)
-                {
-                    logNestedConditions(mv, subGroup, level + 1);
-                }
-            }
+            ("Current managed DLS vehicle is invalid").ToLog(LogLevel.ERROR);
         }
+
+        ManagedVehicle.ActivePlayerVehicle.Vehicle.DebugCurrentModes(showConditionsDetail);
+    }
+
+    [ConsoleCommand]
+    private static void DebugCurrentModesAll(bool showConditionsDetail = true)
+    {
+        foreach (var managedVehicle in Entrypoint.ManagedVehicles.Values)
+        {
+            if (!managedVehicle.Vehicle) continue;
+            managedVehicle.Vehicle.DebugCurrentModes(showConditionsDetail);
+        }
+    }
+
+    [ConsoleCommand]
+    private static void DebugCurrentModesForVehicle([ConsoleCommandParameter(AutoCompleterType = typeof(ConsoleCommandAutoCompleterVehicle))] Vehicle vehicle, bool showConditionsDetail = true)
+    {
+        if (!vehicle)
+        {
+            ("No valid vehicle specified").ToLog(LogLevel.ERROR);
+            return;
+        }
+
+        if (vehicle.GetDLS() == null)
+        {
+            ("Selected vehicle is not managed by DLS").ToLog(LogLevel.ERROR);
+            return;
+        }
+
+        vehicle.DebugCurrentModes(showConditionsDetail);
     }
 }

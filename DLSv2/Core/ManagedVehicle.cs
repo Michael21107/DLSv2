@@ -1,367 +1,578 @@
-﻿using DLSv2.Core.Lights;
-using DLSv2.Core.Sound;
+﻿using System;
 using DLSv2.Threads;
 using DLSv2.Utils;
 using Rage;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace DLSv2.Core
+namespace DLSv2.Core;
+
+public class ManagedVehicle
 {
-    public class ManagedVehicle
+    // Stores the current player's active vehicle.
+    public static ManagedVehicle ActivePlayerVehicle { get; set; } = null;
+
+    public List<BaseCondition> Conditions = new();
+
+    public ManagedVehicle(Vehicle vehicle)
     {
-        public List<BaseCondition> Conditions = new List<BaseCondition>();
+        if (!vehicle) return;
 
-        public ManagedVehicle(Vehicle vehicle)
+        Vehicle = vehicle;
+        VehicleHandle = vehicle.Handle;
+
+        Entrypoint.DLSModels.TryGetValue(vehicle.Model, out var _dlsModel);
+        if (_dlsModel == null) return;
+        dlsModel = _dlsModel;
+
+        // Adds Light Control Groups and Modes
+        foreach (var cG in dlsModel.ControlGroups)
+            LightControlGroups.Add(cG.Name, new LightControlGroupInstance(cG));
+
+        foreach (var mode in dlsModel.Modes)
+            LightModes.Add(mode.Name, new LightModeInstance(mode));
+
+        // Adds Audio Control Groups and Modes
+        foreach (var cG in dlsModel.AudioSettings.AudioControlGroups)
+            AudioControlGroups.Add(cG.Name, new AudioControlGroupInstance(cG));
+
+        foreach (var mode in dlsModel.AudioSettings.AudioModes)
+            AudioModes.Add(mode.Name, new AudioModeInstance(mode));
+
+        // Adds Light Triggers
+        foreach (var mode in LightModes.Values.Select(x => x.BaseMode))
         {
-            if (!vehicle) return;
-
-            Vehicle = vehicle;
-            VehicleHandle = vehicle.Handle;
-
-            // Adds Light Control Groups and Modes
-            foreach (var cG in ControlGroupManager.ControlGroups[vehicle.Model].Values)
-                LightControlGroups.Add(cG.Name, (false, 0));             
-
-            foreach (var mode in ModeManager.Modes[vehicle.Model].Values)
-                StandaloneLightModes.Add(mode.Name, false);
-
-            // Adds Audio Control Groups and Modes
-            foreach (var cG in AudioControlGroupManager.ControlGroups[vehicle.Model].Values)
-            {
-                AudioControlGroups.Add(cG.Name, (false, 0));
-                AudioCGManualing.Add(cG.Name, (false, 0));
-            }                
-
-            foreach (var mode in AudioModeManager.Modes[vehicle.Model].Values)
-                AudioModes.Add(mode.Name, false);
-
-            // Adds Triggers
-            foreach (var mode in ModeManager.Modes[vehicle.Model].Values)
-            {
-                var triggersAndRequirements = new AllCondition(mode.Triggers, mode.Requirements);
+            var triggersAndRequirements = new AllCondition(mode.Requirements, mode.Triggers);
                 
-                Conditions.Add(triggersAndRequirements);
+            Conditions.Add(triggersAndRequirements);
 
-                // if triggers change (to true or false from the opposite), update the mode
-                triggersAndRequirements.GetInstance(this).OnInstanceTriggered += (sender, condition, state) =>
-                {
-                    ModeManager.SetStandaloneModeStatus(this, mode, state);
-                    LightController.Update(this);
-                };
+            // if triggers change (to true or false from the opposite), update the mode
+            triggersAndRequirements.GetInstance(this).OnInstanceTriggered += (sender, condition, state) =>
+            {
+                LightModes[mode.Name].EnabledByTrigger = state;
+                UpdateLights();
+            };
 
-                // if requirements become false, turn off the mode
-                mode.Requirements.GetInstance(this).OnInstanceTriggered += (sender, condition, state) =>
-                {
-                    if (state) return;
+            // if requirements become false, turn off the mode
+            mode.Requirements.GetInstance(this).OnInstanceTriggered += (sender, condition, state) =>
+            {
+                if (!state) LightModes[mode.Name].EnabledByTrigger = false;
+                UpdateLights();
+            };
+        }
+        
+        // Adds Audio Triggers
+        foreach (var mode in AudioModes.Values.Select(x => x.BaseMode))
+        {
+            var triggersAndRequirements = new AllCondition(mode.Requirements, mode.Triggers);
+                
+            Conditions.Add(triggersAndRequirements);
 
-                    ModeManager.SetStandaloneModeStatus(this, mode, state);
-                    LightController.Update(this);
-                };
-            }
+            // if triggers change (to true or false from the opposite), update the mode
+            triggersAndRequirements.GetInstance(this).OnInstanceTriggered += (sender, condition, state) =>
+            {
+                AudioModes[mode.Name].EnabledByTrigger = state;
+                UpdateAudio();
+            };
 
-            EmptyMode = Mode.GetEmpty(vehicle);
-
-            var temp = vehicle.IsSirenOn;
-            vehicle.IsSirenOn = false;
-            vehicle.IsSirenOn = temp;
-
-            vehicle.ClearSiren();
+            // if requirements become false, turn off the mode
+            mode.Requirements.GetInstance(this).OnInstanceTriggered += (sender, condition, state) =>
+            {
+                if (!state) AudioModes[mode.Name].EnabledByTrigger = false;
+                UpdateAudio();
+            };
         }
 
-        /// <summary>
-        /// Vehicle Info
-        /// </summary>
-        public Vehicle Vehicle { get; set; }
-        public uint VehicleHandle { get; set; }
-        public Dictionary<int, bool> ManagedExtras = new Dictionary<int, bool>(); // Managed Extras - ID, original state
+        EmptyMode = vehicle.GetEmptyMode();
+        DefaultMode = LightModes[dlsModel.DefaultModeName];
 
-        /// <summary>
-        /// Lights
-        /// </summary>
-        public bool LightsOn
+        var temp = vehicle.IsSirenOn;
+        vehicle.IsSirenOn = false;
+        vehicle.IsSirenOn = temp;
+
+        VehicleOwner.OnIsPlayerVehicleChanged += SetIsPlayerOwned;
+
+        SetIsPlayerOwned(vehicle, vehicle.IsPlayerVehicle());
+    }
+
+    private void SetIsPlayerOwned(Vehicle v, bool isPlayerOwned)
+    {
+        if (isPlayerOwned)
         {
-            get => Vehicle.IsSirenOn;
+            v.DisableSirenSounds();
+            DefaultMode.EnabledByTrigger = false;
+        } else
+        {
+            bool silent = v.IsSirenSilent;
+            ClearAll();
+            v.EnableSirenSounds();
+            DefaultMode.EnabledByTrigger = true;
+            v.IsSirenSilent = silent;
+        }
+
+        UpdateLights();
+    }
+
+    /// <summary>
+    /// Vehicle Info
+    /// </summary>
+    public Vehicle Vehicle { get; }
+    public DLSModel dlsModel { get; }
+    public uint VehicleHandle { get; }
+    public Dictionary<int, bool> ManagedExtras = new Dictionary<int, bool>(); // Managed Extras - ID, original state
+    public Dictionary<int, int> ManagedPaint = new Dictionary<int, int>(); // Managed Paint Settings - Paint index, original color code
+    private bool areLightsOn;
+    public Animation ActiveAnim;
+
+    /// <summary>
+    /// Lights
+    /// </summary>
+    public bool LightsOn
+    {
+        get => areLightsOn;
             
-            set
+        set
+        {
+            if (value)
             {
-                if (value)
+                if (!Vehicle.IsSirenOn) Vehicle.IsSirenOn = true;
+                SyncManager.SyncSirens(Vehicle);
+            } else
+            {
+                Vehicle.IsSirenOn = false;
+            }
+
+            areLightsOn = value;
+        }
+    }
+    public bool InteriorLight { get; set; }
+    public VehicleIndicatorLightsStatus IndStatus { get; set; } = VehicleIndicatorLightsStatus.Off;
+    public Dictionary<string, LightControlGroupInstance> LightControlGroups = new();
+    public Dictionary<string, LightModeInstance> LightModes = new();
+    public LightModeInstance DefaultMode;
+
+    public LightMode EmptyMode;
+
+    /// <summary>
+    /// Sirens
+    /// </summary>
+    public bool SirenOn { get; set; } = false;
+    public Dictionary<string, int> SoundIds = new();
+    public Dictionary<string, AudioControlGroupInstance> AudioControlGroups = new();
+    public Dictionary<string, AudioModeInstance> AudioModes = new();
+
+    public void ClearAll()
+    {
+        // Clears light modes
+        foreach (var mode in LightModes.Values)
+            mode.Enabled = false;
+
+        // Clears light control groups
+        foreach (var cG in LightControlGroups.Values)
+            cG.Disable();
+
+        // Updates lights
+        UpdateLights();
+
+        // Clears audio control groups
+        foreach (var cG in AudioControlGroups.Values)
+            cG.Disable();
+
+        // Updates audio
+        UpdateAudio();
+    }
+
+    // Registers input
+    public void RegisterInputs()
+    {
+        ControlsManager.ClearInputs();
+        // Light Inputs
+        foreach (var cG in LightControlGroups.Values)
+        {
+            string toggleKey = cG.BaseControlGroup.Toggle;
+            string cycleKey = cG.BaseControlGroup.Cycle;
+            string reverseCycleKey = cG.BaseControlGroup.ReverseCycle;
+
+            bool hasToggle = ControlsManager.RegisterInput(toggleKey);
+            if (hasToggle)
+            {
+                ControlsManager.Inputs[toggleKey].OnInputReleased += (sender, inputName) =>
                 {
-                    SyncManager.SyncSirens(Vehicle);
-                    if (!Vehicle.IsSirenOn) Vehicle.IsSirenOn = true;
-                } else
+                    ControlsManager.PlayInputSound();
+                    cG.Toggle();
+                    UpdateLights();
+                };
+            }
+            
+            bool hasCycle = ControlsManager.RegisterInput(cycleKey);
+            if (hasCycle)
+            {
+                ControlsManager.Inputs[cycleKey].OnInputReleased += (sender, inputName) =>
                 {
-                    Vehicle.IsSirenOn = false;
-                }
+                    ControlsManager.PlayInputSound();
+                    cG.MoveToNext(!hasToggle);
+                    UpdateLights();
+                };
+            }
+
+            bool hasReverseCycle = ControlsManager.RegisterInput(reverseCycleKey);
+            if (hasReverseCycle)
+            {
+                ControlsManager.Inputs[reverseCycleKey].OnInputReleased += (sender, inputName) =>
+                {
+                    ControlsManager.PlayInputSound();
+                    cG.MoveToPrevious(!hasToggle);
+                    UpdateLights();
+                };
+            }
+
+            foreach (var mode in cG.BaseControlGroup.Modes)
+            {
+                bool hasModeToggle = ControlsManager.RegisterInput(mode.Toggle);
+                if (!hasModeToggle) continue;
+                
+                ControlsManager.Inputs[mode.Toggle].OnInputReleased += (sender, inputName) =>
+                {
+                    ControlsManager.PlayInputSound();
+                    int index = cG.BaseControlGroup.Modes.IndexOf(mode);
+                    
+                    if (cG.BaseControlGroup.Exclusive)
+                    {
+                        if (cG.Enabled && cG.ActiveIndexes.Contains(index))
+                            cG.ActiveIndexes = new();
+                        else
+                            cG.ActiveIndexes = new() { index };
+                    }
+                    else
+                    {
+                        if (cG.ActiveIndexes.Contains(index))
+                            cG.ActiveIndexes.Remove(index);
+                        else
+                            cG.ActiveIndexes.Add(index);
+                    }
+                    
+                    UpdateLights();
+                };
             }
         }
-        public bool InteriorLight { get; set; }
-        public VehicleIndicatorLightsStatus IndStatus { get; set; } = VehicleIndicatorLightsStatus.Off;
-        public Dictionary<string, (bool Status, int Index)> LightControlGroups = new Dictionary<string, (bool, int)>();
-        public Dictionary<string, bool> StandaloneLightModes = new Dictionary<string, bool>();
-        public List<string> ActiveLightModes = new List<string>();
 
-        public Mode EmptyMode;
-
-        /// <summary>
-        /// Sirens
-        /// </summary>
-        public bool SirenOn { get; set; } = false;
-        public Dictionary<string, int> SoundIds = new Dictionary<string, int>();
-        public Dictionary<string, (bool IsActive, int Index)> AudioControlGroups = new Dictionary<string, (bool, int)>();
-        public Dictionary<string, (bool IsManualing, int Index)> AudioCGManualing = new Dictionary<string, (bool, int)>();
-        public Dictionary<string, bool> AudioModes = new Dictionary<string, bool>();
-        public List<string> ActiveAudioModes = new List<string>();
-
-        // Registers input
-        public void RegisterInputs()
+        // Audio Control group and modes keys
+        foreach (var cG in AudioControlGroups.Values)
         {
-            // Light Inputs
-            foreach (ControlGroup cG in ControlGroupManager.ControlGroups[Vehicle.Model].Values)
+            string toggleKey = cG.BaseControlGroup.Toggle;
+            string cycleKey = cG.BaseControlGroup.Cycle;
+            string reverseCycleKey = cG.BaseControlGroup.ReverseCycle;
+
+            bool hasToggle = ControlsManager.RegisterInput(toggleKey);
+            if (hasToggle)
             {
-                bool hasToggle = ControlsManager.RegisterInput(cG.Toggle);
-                bool hasCycle = ControlsManager.RegisterInput(cG.Cycle);
+                ControlsManager.Inputs[toggleKey].OnInputReleased += (sender, inputName) =>
+                {
+                    ControlsManager.PlayInputSound();
+                    cG.Toggle();
+                    UpdateAudio();
+                };
+            }
+            
+            bool hasCycle = ControlsManager.RegisterInput(cycleKey);
+            if (hasCycle)
+            {
+                ControlsManager.Inputs[cycleKey].OnInputReleased += (sender, inputName) =>
+                {
+                    if (!cG.Enabled) return;
+                    ControlsManager.PlayInputSound();
+                    cG.MoveToNext(!hasToggle);
+                    UpdateAudio();
+                };
+            }
 
-                if (hasToggle && hasCycle)
+            bool hasReverseCycle = ControlsManager.RegisterInput(reverseCycleKey);
+            if (hasReverseCycle)
+            {
+                ControlsManager.Inputs[reverseCycleKey].OnInputReleased += (sender, inputName) =>
                 {
-                    ControlsManager.Inputs[cG.Toggle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        ControlGroupManager.ToggleControlGroup(this, cG.Name);
-                        LightController.Update(this);
-                    };
-                    ControlsManager.Inputs[cG.Cycle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        ControlGroupManager.NextInControlGroup(this, cG.Name);
-                        LightController.Update(this);
-                    };
-                }
-                else if (hasToggle && !hasCycle)
-                {
-                    ControlsManager.Inputs[cG.Toggle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        ControlGroupManager.ToggleControlGroup(this, cG.Name, true);
-                        LightController.Update(this);
-                    };
-                }
-                else if (!hasToggle && hasCycle)
-                {
-                    ControlsManager.Inputs[cG.Cycle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        ControlGroupManager.NextInControlGroup(this, cG.Name);
-                        LightController.Update(this);
-                    };
-                }
+                    if (!cG.Enabled) return;
+                    ControlsManager.PlayInputSound();
+                    cG.MoveToPrevious(!hasToggle);
+                    UpdateAudio();
+                };
+            }
 
-                if (ControlsManager.RegisterInput(cG.ReverseCycle))
+            foreach (AudioModeSelection mode in cG.BaseControlGroup.Modes)
+            {
+                bool hasModeToggle = ControlsManager.RegisterInput(mode.Toggle);
+                if (hasModeToggle)
                 {
-                    ControlsManager.Inputs[cG.ReverseCycle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        ControlGroupManager.PreviousInControlGroup(this, cG.Name);
-                        LightController.Update(this);
-                    };
-                }
-
-                foreach (ModeSelection mode in cG.Modes)
-                {
-                    if (!ControlsManager.RegisterInput(mode.Toggle)) continue;
                     ControlsManager.Inputs[mode.Toggle].OnInputReleased += (sender, inputName) =>
                     {
                         ControlsManager.PlayInputSound();
-                        int index = cG.Modes.IndexOf(mode);
-                        if (this.LightControlGroups[cG.Name].Item1 && this.LightControlGroups[cG.Name].Item2 == index)
-                            ControlGroupManager.ToggleControlGroup(this, cG.Name);
-                        else
-                            ControlGroupManager.SetControlGroupIndex(this, cG.Name, index);
-                        LightController.Update(this);
-                    };
-                }
-            }
-
-            // Audio Control group and modes keys
-            foreach (AudioControlGroup cG in AudioControlGroupManager.ControlGroups[Vehicle.Model].Values)
-            {
-                bool hasToggle = ControlsManager.RegisterInput(cG.Toggle);
-                bool hasCycle = ControlsManager.RegisterInput(cG.Cycle);
-
-                if (hasToggle && hasCycle)
-                {
-                    ControlsManager.Inputs[cG.Toggle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        AudioControlGroupManager.ToggleControlGroup(this, cG.Name);
-                        AudioController.Update(this);
-                    };
-                    ControlsManager.Inputs[cG.Cycle].OnInputReleased += (sender, inputName) =>
-                    {
-                        if (!AudioControlGroups[cG.Name].Item1) return;
-                        ControlsManager.PlayInputSound();
-                        AudioControlGroupManager.NextInControlGroup(this, cG.Name);
-                        AudioController.Update(this);
-                    };
-                }
-                else if (hasToggle && !hasCycle)
-                {
-                    ControlsManager.Inputs[cG.Toggle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        AudioControlGroupManager.ToggleControlGroup(this, cG.Name, true);
-                        AudioController.Update(this);
-                    };
-                }
-                else if (!hasToggle && hasCycle)
-                {
-                    ControlsManager.Inputs[cG.Cycle].OnInputReleased += (sender, inputName) =>
-                    {
-                        ControlsManager.PlayInputSound();
-                        AudioControlGroupManager.NextInControlGroup(this, cG.Name, cycleOnly: true);
-                        AudioController.Update(this);
-                    };
-                }
-
-                if (ControlsManager.RegisterInput(cG.ReverseCycle))
-                {
-                    ControlsManager.Inputs[cG.ReverseCycle].OnInputReleased += (sender, inputName) =>
-                    {
-                        if (!AudioControlGroups[cG.Name].Item1) return;
-                        ControlsManager.PlayInputSound();
-                        AudioControlGroupManager.PreviousInControlGroup(this, cG.Name);
-                        AudioController.Update(this);
-                    };
-                }
-
-                foreach (AudioModeSelection mode in cG.Modes)
-                {
-                    if (ControlsManager.RegisterInput(mode.Toggle))
-                    {
-                        ControlsManager.Inputs[mode.Toggle].OnInputReleased += (sender, inputName) =>
+                        int index = cG.BaseControlGroup.Modes.IndexOf(mode);
+                        
+                        if (cG.BaseControlGroup.Exclusive)
                         {
-                            ControlsManager.PlayInputSound();
-                            int index = cG.Modes.IndexOf(mode);
-                            if (AudioControlGroups[cG.Name].Item1 && AudioControlGroups[cG.Name].Item2 == index)
-                                AudioControlGroupManager.ToggleControlGroup(this, cG.Name);
+                            if (cG.Enabled && cG.ActiveIndexes.Contains(index))
+                                cG.ActiveIndexes = new();
                             else
-                                AudioControlGroupManager.SetControlGroupIndex(this, cG.Name, index);
-                            AudioController.Update(this);
-                        };
-                    }                    
+                                cG.ActiveIndexes = new() { index };
+                        }
+                        else
+                        {
+                            if (cG.ActiveIndexes.Contains(index))
+                                cG.ActiveIndexes.Remove(index);
+                            else
+                                cG.ActiveIndexes.Add(index);
+                        }
+                        UpdateAudio();
+                    };
+                }
 
-                    if (ControlsManager.RegisterInput(mode.Hold))
+                bool hasModeHold = ControlsManager.RegisterInput(mode.Hold);
+                if (hasModeHold)
+                {
+                    ControlsManager.Inputs[mode.Hold].OnInputPressed += (sender, inputName) =>
                     {
-                        ControlsManager.Inputs[mode.Hold].OnInputPressed += (sender, inputName) =>
-                        {
-                            int index = cG.Modes.IndexOf(mode);
-                            if (AudioControlGroups[cG.Name].Item1 && AudioControlGroups[cG.Name].Item2 != index)
-                            {
-                                AudioCGManualing[cG.Name] = (true, AudioControlGroups[cG.Name].Item2);
-                                AudioControlGroupManager.SetControlGroupIndex(this, cG.Name, index);
-                                AudioController.Update(this);
-                            }
-                            else if (!AudioControlGroups[cG.Name].Item1)
-                            {
-                                AudioCGManualing[cG.Name] = (true, -1);
-                                AudioControlGroupManager.ToggleControlGroup(this, cG.Name);
-                                AudioControlGroupManager.SetControlGroupIndex(this, cG.Name, index);
-                                AudioController.Update(this);
-                            }
-                        };
+                        int index = cG.BaseControlGroup.Modes.IndexOf(mode);
+                        if (cG.ActiveIndexes.Contains(index)) return;
+                        
+                        cG.ManualingEnabled = true;
+                        cG.ManualingIndex = cG.ActiveIndexes.Count > 0 ? cG.ActiveIndexes[0] : -1;
+                        
+                        if (cG.BaseControlGroup.Exclusive)
+                            cG.ActiveIndexes = [index];
+                        else
+                            cG.ActiveIndexes.Add(index);
+                        
+                        UpdateAudio();
+                    };
 
-                        ControlsManager.Inputs[mode.Hold].OnInputReleased += (sender, inputName) =>
+                    ControlsManager.Inputs[mode.Hold].OnInputReleased += (sender, inputName) =>
+                    {
+                        if (!cG.ManualingEnabled) return;
+                        
+                        if (cG.ManualingIndex == -1)
+                            cG.ActiveIndexes = [];
+                        else
                         {
-                            if (AudioCGManualing[cG.Name].Item1)
-                            {
-                                if (AudioCGManualing[cG.Name].Item2 == -1)
-                                    AudioControlGroupManager.ToggleControlGroup(this, cG.Name);
-                                else
-                                    AudioControlGroupManager.SetControlGroupIndex(this, cG.Name, AudioCGManualing[cG.Name].Item2);
-                                AudioCGManualing[cG.Name] = (false, 0);
-                                AudioController.Update(this);
-                            }
-                        };
-                    }
+                            if (cG.BaseControlGroup.Exclusive)
+                                cG.ActiveIndexes = [cG.ManualingIndex];
+                            else
+                                cG.ActiveIndexes.Remove(cG.BaseControlGroup.Modes.IndexOf(mode));
+                        }
+                        cG.ManualingEnabled = false;
+                        cG.ManualingIndex = 0;
+                        UpdateAudio();
+                    };
                 }
             }
+        }
 
-            // General Inputs
-            // Toggle Keys Locked
-            ControlsManager.RegisterInput("LOCKALL");
+        // General Inputs
+        // Toggle Keys Locked
+        if (ControlsManager.RegisterInput("LOCKALL"))
+        {
             ControlsManager.Inputs["LOCKALL"].OnInputReleased += (sender, inputName) =>
             {
                 ControlsManager.PlayInputSound();
                 ControlsManager.KeysLocked = !ControlsManager.KeysLocked;
             };
+        }
 
-            // Kills all lights and audio
-            ControlsManager.RegisterInput("KILLALL");
+        // Kills all lights and audio
+        if (ControlsManager.RegisterInput("KILLALL"))
+        {
             ControlsManager.Inputs["KILLALL"].OnInputReleased += (sender, inputName) =>
             {
                 ControlsManager.PlayInputSound();
-
-                // Clears light modes
-                foreach (string key in StandaloneLightModes.Keys.ToList())
-                    StandaloneLightModes[key] = false;
-
-                // Clears light control groups
-                foreach (string key in LightControlGroups.Keys.ToList())
-                    LightControlGroups[key] = (false, 0);
-
-                // Updates lights
-                LightController.Update(this);
-
-                // Clears audio control groups
-                foreach (string key in AudioControlGroups.Keys.ToList())
-                    AudioControlGroups[key] = (false, 0);
-
-                // Updates audio
-                AudioController.Update(this);
+                ClearAll();
             };
+        }
 
-            // Interior Light
-            ControlsManager.RegisterInput("INTLT");
+        // Interior Light
+        if (ControlsManager.RegisterInput("INTLT"))
+        {
             ControlsManager.Inputs["INTLT"].OnInputReleased += (sender, inputName) =>
             {
                 ControlsManager.PlayInputSound();
 
                 InteriorLight = !InteriorLight;
-                GenericLights.SetInteriorLight(Vehicle, InteriorLight);
+                Vehicle.IsInteriorLightOn = InteriorLight;
             };
+        }
 
-            // Indicator Left
-            ControlsManager.RegisterInput("INDL");
+        // Indicator Left
+        if (ControlsManager.RegisterInput("INDL"))
+        {
             ControlsManager.Inputs["INDL"].OnInputReleased += (sender, inputName) =>
             {
                 ControlsManager.PlayInputSound();
 
                 IndStatus = IndStatus == VehicleIndicatorLightsStatus.LeftOnly ? VehicleIndicatorLightsStatus.Off : VehicleIndicatorLightsStatus.LeftOnly;
-
-                GenericLights.SetIndicator(Vehicle, IndStatus);
+                Vehicle.IndicatorLightsStatus = IndStatus;
             };
+        }
 
-            // Indicator Right
-            ControlsManager.RegisterInput("INDR");
+        // Indicator Right
+        if (ControlsManager.RegisterInput("INDR"))
+        {
             ControlsManager.Inputs["INDR"].OnInputReleased += (sender, inputName) =>
             {
                 ControlsManager.PlayInputSound();
 
                 IndStatus = IndStatus == VehicleIndicatorLightsStatus.RightOnly ? VehicleIndicatorLightsStatus.Off : VehicleIndicatorLightsStatus.RightOnly;
-
-                GenericLights.SetIndicator(Vehicle, IndStatus);
+                Vehicle.IndicatorLightsStatus = IndStatus;
             };
+        }
 
-            // Hazards
-            ControlsManager.RegisterInput("HZRD");
+        // Hazards
+        if (ControlsManager.RegisterInput("HZRD"))
+        {
             ControlsManager.Inputs["HZRD"].OnInputReleased += (sender, inputName) =>
             {
                 ControlsManager.PlayInputSound();
 
                 IndStatus = IndStatus == VehicleIndicatorLightsStatus.Both ? VehicleIndicatorLightsStatus.Off : VehicleIndicatorLightsStatus.Both;
-
-                GenericLights.SetIndicator(Vehicle, IndStatus);
+                Vehicle.IndicatorLightsStatus = IndStatus;
             };
         }
+    }
+
+    public void UpdateLights()
+    {
+        if (!Vehicle) return;
+
+        // Start with no modes activated
+        List<LightMode> modes = new();
+
+        // Go through all modes in order, and enable modes based on trigger criteria
+        foreach (var instance in LightModes.Values.Where(x => x.EnabledByTrigger))
+            modes.Add(instance.BaseMode);
+
+        // Go through all control groups in order, and enable modes based on control inputs
+        foreach (var instance in LightControlGroups.Values.Where(x => x.Enabled))
+        {
+            // If group is exclusive, disables every mode if enabled previously
+            if (instance.BaseControlGroup.Exclusive)
+            {
+                List<string> cGExclusiveModes = new();
+                foreach (var modeSelection in instance.BaseControlGroup.Modes)
+                    cGExclusiveModes.AddRange(modeSelection.Modes);
+
+                modes.RemoveAll(x => cGExclusiveModes.Contains(x.Name));
+            }
+
+            foreach (var modeIndex in instance.ActiveIndexes)
+            {
+                foreach (var modeName in instance.BaseControlGroup.Modes[modeIndex].Modes)
+                    modes.Add(LightModes[modeName].BaseMode);
+            }
+        }
+
+        // Remove modes that are disabled
+        foreach (var mode in modes.ToArray())
+        {
+            if (!mode.Requirements.GetInstance(this).LastTriggered) modes.RemoveAll(m => m == mode);
+        }
+
+        // Sort modes by the order they initially appear in the config file
+        modes = modes.OrderBy(d => dlsModel.Modes.IndexOf(d)).ToList();
+
+        // Disable modes that are not in the new list of enabled modes
+        foreach (var item in LightModes.Values)
+            if (item.Enabled && !modes.Contains(item.BaseMode))
+                item.Enabled = false;
+
+        // If no active modes, clears EL and disables siren
+        if (modes.Count == 0)
+        {
+            if (Vehicle.IsPlayerVehicle() || !Vehicle.IsSirenOn) LightsOn = false;
+            this.ApplyLightModes(new List<LightMode>());
+            //AudioController.KillSirens(managedVehicle);
+            return;
+        }
+
+        // Turns on vehicle siren
+        if (Vehicle.IsPlayerVehicle() || Vehicle.IsSirenOn) LightsOn = true;
+
+        // Sets EL with appropriate modes
+        this.ApplyLightModes(modes);
+    }
+
+    public void UpdateAudio()
+    {
+        if (!Vehicle) return;
+            
+        // Start with no modes activated
+        List<AudioMode> modes = new();
+        
+        // Go through all modes in order, and enable modes based on trigger criteria
+        foreach (var instance in AudioModes.Values.Where(x => x.EnabledByTrigger))
+            modes.Add(instance.BaseMode);
+
+        // Go through all control groups in order, and enable modes based on control inputs
+        foreach (var instance in AudioControlGroups.Values.Where(x => x.Enabled))
+        {
+            // If group is exclusive, disables every mode if enabled previously
+            if (instance.BaseControlGroup.Exclusive)
+            {
+                List<string> cGExclusiveModes = new();
+                foreach (var modeSelection in instance.BaseControlGroup.Modes)
+                    cGExclusiveModes.AddRange(modeSelection.Modes);
+
+                modes.RemoveAll(x => cGExclusiveModes.Contains(x.Name));
+            }
+            
+            foreach (var modeIndex in instance.ActiveIndexes)
+            {
+                foreach (var modeName in instance.BaseControlGroup.Modes[modeIndex].Modes)
+                    modes.Add(AudioModes[modeName].BaseMode);
+            }
+        }
+        
+        // Remove modes that are disabled
+        foreach (var mode in modes.ToArray())
+        {
+            if (!mode.Requirements.GetInstance(this).LastTriggered) modes.RemoveAll(m => m == mode);
+        }
+
+        var audioModes = modes.Select(x => x.Name).ToList();
+        foreach (var item in AudioModes.Values)
+            if (item.Enabled && !audioModes.Contains(item.BaseMode.Name))
+            {
+                item.Enabled = false;
+                StopMode(item.BaseMode.Name);
+            }
+
+        // If no active modes
+        if (modes.Count == 0)
+        {
+            SirenOn = false;
+            Vehicle.IsSirenSilent = true;
+            return;
+        }
+
+        SirenOn = true;
+        Vehicle.IsSirenSilent = false;
+
+        modes = modes.OrderBy(d => dlsModel.AudioSettings.AudioModes.IndexOf(d)).ToList();
+
+        // Sets EL with appropriate modes
+        foreach (var audioMode in modes)
+        {
+            AudioModes[audioMode.Name].Enabled = true;
+            PlayMode(audioMode);
+        }
+    }
+        
+    public void PlayMode(AudioMode mode)
+    {
+        if (SoundIds.ContainsKey(mode.Name)) return;
+        SoundIds[mode.Name] = Vehicle.PlaySoundFromEntity(mode.Sound.ScriptName, mode.Sound.SoundSet, mode.Sound.SoundBank);
+    }
+
+    public void StopMode(string mode)
+    {
+        if (!SoundIds.ContainsKey(mode)) return;
+        Audio.StopSound(SoundIds[mode]);
+        SoundIds.Remove(mode);
     }
 }
